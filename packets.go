@@ -1,7 +1,6 @@
 // Go MySQL Driver - A MySQL-Driver for Go's database/sql package
 //
-// Copyright 2012 Julien Schmidt. All rights reserved.
-// http://www.julienschmidt.com
+// Copyright 2012 The Go-MySQL-Driver Authors. All rights reserved.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -29,6 +28,7 @@ func (mc *mysqlConn) readPacket() (data []byte, err error) {
 	data, err = mc.buf.readNext(4)
 	if err != nil {
 		errLog.Print(err.Error())
+		mc.Close()
 		return nil, driver.ErrBadConn
 	}
 
@@ -37,6 +37,7 @@ func (mc *mysqlConn) readPacket() (data []byte, err error) {
 
 	if pktLen < 1 {
 		errLog.Print(errMalformPkt.Error())
+		mc.Close()
 		return nil, driver.ErrBadConn
 	}
 
@@ -51,8 +52,7 @@ func (mc *mysqlConn) readPacket() (data []byte, err error) {
 	mc.sequence++
 
 	// Read packet body [pktLen bytes]
-	data, err = mc.buf.readNext(pktLen)
-	if err == nil {
+	if data, err = mc.buf.readNext(pktLen); err == nil {
 		if pktLen < maxPacketSize {
 			return data, nil
 		}
@@ -66,6 +66,9 @@ func (mc *mysqlConn) readPacket() (data []byte, err error) {
 			return append(buf, data...), nil
 		}
 	}
+
+	// err case
+	mc.Close()
 	errLog.Print(err.Error())
 	return nil, driver.ErrBadConn
 }
@@ -138,14 +141,14 @@ func (mc *mysqlConn) splitPacket(data []byte) (err error) {
 
 // Handshake Initialization Packet
 // http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::Handshake
-func (mc *mysqlConn) readInitPacket() (err error) {
+func (mc *mysqlConn) readInitPacket() (cipher []byte, err error) {
 	data, err := mc.readPacket()
 	if err != nil {
 		return
 	}
 
 	if data[0] == iERR {
-		return mc.handleErrorPacket(data)
+		return nil, mc.handleErrorPacket(data)
 	}
 
 	// protocol version [1 byte]
@@ -154,6 +157,7 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 			"Unsupported MySQL Protocol Version %d. Protocol Version %d or higher is required",
 			data[0],
 			minProtocolVersion)
+		return
 	}
 
 	// server version [null terminated string]
@@ -161,7 +165,7 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 	pos := 1 + bytes.IndexByte(data[1:], 0x00) + 1 + 4
 
 	// first part of the password cipher [8 bytes]
-	mc.cipher = append(mc.cipher, data[pos:pos+8]...)
+	cipher = data[pos : pos+8]
 
 	// (filler) always 0x00 [1 byte]
 	pos += 8 + 1
@@ -169,10 +173,10 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 	// capability flags (lower 2 bytes) [2 bytes]
 	mc.flags = clientFlag(binary.LittleEndian.Uint16(data[pos : pos+2]))
 	if mc.flags&clientProtocol41 == 0 {
-		err = errOldProtocol
+		return nil, errOldProtocol
 	}
 	if mc.flags&clientSSL == 0 && mc.cfg.tls != nil {
-		return errNoTLS
+		return nil, errNoTLS
 	}
 	pos += 2
 
@@ -188,7 +192,7 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 		// The documentation is ambiguous about the length.
 		// The official Python library uses the fixed length 12
 		// which is not documented but seems to work.
-		mc.cipher = append(mc.cipher, data[pos:pos+12]...)
+		cipher = append(cipher, data[pos:pos+12]...)
 
 		// TODO: Verify string termination
 		// EOF if version (>= 5.5.7 and < 5.5.10) or (>= 5.6.0 and < 5.6.2)
@@ -206,7 +210,7 @@ func (mc *mysqlConn) readInitPacket() (err error) {
 
 // Client Authentication Packet
 // http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::HandshakeResponse
-func (mc *mysqlConn) writeAuthPacket() error {
+func (mc *mysqlConn) writeAuthPacket(cipher []byte) error {
 	// Adjust client flags based on server support
 	clientFlags := clientProtocol41 |
 		clientSecureConn |
@@ -225,8 +229,7 @@ func (mc *mysqlConn) writeAuthPacket() error {
 	}
 
 	// User Password
-	scrambleBuff := scramblePassword(mc.cipher, []byte(mc.cfg.passwd))
-	mc.cipher = nil
+	scrambleBuff := scramblePassword(cipher, []byte(mc.cfg.passwd))
 
 	pktLen := 4 + 4 + 1 + 23 + len(mc.cfg.user) + 1 + 1 + len(scrambleBuff)
 
@@ -304,6 +307,28 @@ func (mc *mysqlConn) writeAuthPacket() error {
 	}
 
 	// Send Auth packet
+	return mc.writePacket(data)
+}
+
+//  Client old authentication packet
+// http://dev.mysql.com/doc/internals/en/connection-phase.html#packet-Protocol::AuthSwitchResponse
+func (mc *mysqlConn) writeOldAuthPacket(cipher []byte) error {
+	// User password
+	scrambleBuff := scrambleOldPassword(cipher, []byte(mc.cfg.passwd))
+
+	// Calculate the packet lenght and add a tailing 0
+	pktLen := len(scrambleBuff) + 1
+	data := make([]byte, pktLen+4)
+
+	// Add the packet header  [24bit length + 1 byte sequence]
+	data[0] = byte(pktLen)
+	data[1] = byte(pktLen >> 8)
+	data[2] = byte(pktLen >> 16)
+	data[3] = mc.sequence
+
+	// Add the scrambled password [null terminated string]
+	copy(data[4:], scrambleBuff)
+
 	return mc.writePacket(data)
 }
 
@@ -388,7 +413,8 @@ func (mc *mysqlConn) readResultOK() error {
 		case iOK:
 			return mc.handleOkPacket(data)
 
-		case iEOF: // someone is using old_passwords
+		case iEOF:
+			// someone is using old_passwords
 			return errOldPassword
 
 		default: // Error otherwise
@@ -498,7 +524,7 @@ func (mc *mysqlConn) readColumns(count int) (columns []mysqlField, err error) {
 		}
 
 		// EOF Packet
-		if data[0] == iEOF && len(data) == 5 {
+		if data[0] == iEOF && (len(data) == 5 || len(data) == 1) {
 			if i != count {
 				err = fmt.Errorf("ColumnsCount mismatch n:%d len:%d", count, len(columns))
 			}
@@ -629,7 +655,7 @@ func (mc *mysqlConn) readUntilEOF() (err error) {
 		data, err = mc.readPacket()
 
 		// No Err and no EOF Packet
-		if err == nil && (data[0] != iEOF || len(data) != 5) {
+		if err == nil && data[0] != iEOF {
 			continue
 		}
 		return // Err or EOF
@@ -667,11 +693,15 @@ func (stmt *mysqlStmt) readPrepareResultPacket() (columnCount uint16, err error)
 		stmt.paramCount = int(binary.LittleEndian.Uint16(data[pos : pos+2]))
 		pos += 2
 
+		// Reserved [8 bit]
+		pos++
+
 		// Warning count [16 bit uint]
 		if !stmt.mc.strict {
 			return
 		} else {
-			if binary.LittleEndian.Uint16(data[pos:pos+2]) > 0 {
+			// Check for warnings count > 0, only available in MySQL > 4.1
+			if len(data) >= 12 && binary.LittleEndian.Uint16(data[pos:pos+2]) > 0 {
 				err = stmt.mc.getWarnings()
 			}
 		}
@@ -819,7 +849,7 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 			if v.IsZero() {
 				val = []byte("0000-00-00")
 			} else {
-				val = []byte(v.Format(timeFormat))
+				val = []byte(v.In(stmt.mc.cfg.loc).Format(timeFormat))
 			}
 
 			paramValues[i] = append(
