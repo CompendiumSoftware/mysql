@@ -1,7 +1,6 @@
 // Go MySQL Driver - A MySQL-Driver for Go's database/sql package
 //
-// Copyright 2012 Julien Schmidt. All rights reserved.
-// http://www.julienschmidt.com
+// Copyright 2012 The Go-MySQL-Driver Authors. All rights reserved.
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
@@ -21,7 +20,6 @@ import (
 type mysqlConn struct {
 	cfg              *config
 	flags            clientFlag
-	cipher           []byte
 	netConn          net.Conn
 	buf              *buffer
 	protocol         uint8
@@ -35,17 +33,18 @@ type mysqlConn struct {
 }
 
 type config struct {
-	user            string
-	passwd          string
-	net             string
-	addr            string
-	dbname          string
-	params          map[string]string
-	loc             *time.Location
-	timeout         time.Duration
-	tls             *tls.Config
-	allowAllFiles   bool
-	clientFoundRows bool
+	user              string
+	passwd            string
+	net               string
+	addr              string
+	dbname            string
+	params            map[string]string
+	loc               *time.Location
+	timeout           time.Duration
+	tls               *tls.Config
+	allowAllFiles     bool
+	allowOldPasswords bool
+	clientFoundRows   bool
 }
 
 // Handles parameters set in DSN
@@ -109,11 +108,16 @@ func (mc *mysqlConn) Begin() (driver.Tx, error) {
 }
 
 func (mc *mysqlConn) Close() (err error) {
-	mc.writeCommandPacket(comQuit)
+	// Makes Close idempotent
+	if mc.netConn != nil {
+		mc.writeCommandPacket(comQuit)
+		mc.netConn.Close()
+		mc.netConn = nil
+	}
+
 	mc.cfg = nil
 	mc.buf = nil
-	mc.netConn.Close()
-	mc.netConn = nil
+
 	return
 }
 

@@ -1,3 +1,11 @@
+// Go MySQL Driver - A MySQL-Driver for Go's database/sql package
+//
+// Copyright 2013 The Go-MySQL-Driver Authors. All rights reserved.
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at http://mozilla.org/MPL/2.0/.
+
 package mysql
 
 import (
@@ -159,6 +167,47 @@ func TestRawBytesResultExceedsBuffer(t *testing.T) {
 			dbt.Error("result did not match expected value")
 		}
 	})
+}
+
+func TestTimezoneConversion(t *testing.T) {
+
+	zones := []string{"UTC", "US/Central", "US/Pacific", "Local"}
+
+	// Regression test for timezone handling
+	tzTest := func(dbt *DBTest) {
+
+		// Create table
+		dbt.mustExec("CREATE TABLE test (ts TIMESTAMP)")
+
+		// Insert local time into database (should be converted)
+		usCentral, _ := time.LoadLocation("US/Central")
+		now := time.Now().In(usCentral)
+		dbt.mustExec("INSERT INTO test VALUE (?)", now)
+
+		// Retrieve time from DB
+		rows := dbt.mustQuery("SELECT ts FROM test")
+		if !rows.Next() {
+			dbt.Fatal("Didn't get any rows out")
+		}
+
+		var nowDB time.Time
+		err := rows.Scan(&nowDB)
+		if err != nil {
+			dbt.Fatal("Err", err)
+		}
+
+		// Check that dates match
+		if now.Unix() != nowDB.Unix() {
+			dbt.Errorf("Times don't match.\n")
+			dbt.Errorf(" Now(%v)=%v\n", usCentral, now)
+			dbt.Errorf(" Now(UTC)=%v\n", nowDB)
+		}
+
+	}
+
+	for _, tz := range zones {
+		runTests(t, dsn+"&parseTime=true&loc="+tz, tzTest)
+	}
 }
 
 func TestCRUD(t *testing.T) {
@@ -1054,7 +1103,7 @@ func TestStmtMultiRows(t *testing.T) {
 
 func TestConcurrent(t *testing.T) {
 	if enabled, _ := readBool(os.Getenv("MYSQL_TEST_CONCURRENT")); !enabled {
-		t.Skip("CONCURRENT env var not set")
+		t.Skip("MYSQL_TEST_CONCURRENT env var not set")
 	}
 
 	runTests(t, dsn, func(dbt *DBTest) {
@@ -1100,88 +1149,4 @@ func TestConcurrent(t *testing.T) {
 
 		dbt.Logf("Reached %d concurrent connections \r\n", max)
 	})
-}
-
-// BENCHMARKS
-var sample []byte
-
-func initBenchmarks() ([]byte, int, int) {
-	if sample == nil {
-		sample = []byte(strings.Repeat("0123456789abcdef", 1024*1024))
-	}
-	return sample, 16, len(sample)
-}
-
-func BenchmarkRoundtripText(b *testing.B) {
-	sample, min, max := initBenchmarks()
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		b.Fatalf("crashed")
-	}
-	defer db.Close()
-	var result string
-	for i := 0; i < b.N; i++ {
-		length := min + i
-		if length > max {
-			length = max
-		}
-		test := string(sample[0:length])
-		rows, err := db.Query("SELECT \"" + test + "\"")
-		if err != nil {
-			b.Fatalf("crashed")
-		}
-		if !rows.Next() {
-			rows.Close()
-			b.Fatalf("crashed")
-		}
-		err = rows.Scan(&result)
-		if err != nil {
-			rows.Close()
-			b.Fatalf("crashed")
-		}
-		if result != test {
-			rows.Close()
-			b.Errorf("mismatch")
-		}
-		rows.Close()
-	}
-}
-
-func BenchmarkRoundtripPrepared(b *testing.B) {
-	sample, min, max := initBenchmarks()
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		b.Fatalf("crashed")
-	}
-	defer db.Close()
-	var result string
-	stmt, err := db.Prepare("SELECT ?")
-	if err != nil {
-		b.Fatalf("crashed")
-	}
-	for i := 0; i < b.N; i++ {
-		length := min + i
-		if length > max {
-			length = max
-		}
-		test := string(sample[0:length])
-		rows, err := stmt.Query(test)
-		if err != nil {
-			b.Fatalf("crashed")
-		}
-		if !rows.Next() {
-			rows.Close()
-			b.Fatalf("crashed")
-		}
-		err = rows.Scan(&result)
-		if err != nil {
-			rows.Close()
-			b.Fatalf("crashed")
-		}
-		if result != test {
-			rows.Close()
-			b.Errorf("mismatch")
-		}
-		rows.Close()
-	}
 }
